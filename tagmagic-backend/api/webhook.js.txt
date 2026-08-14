@@ -1,0 +1,115 @@
+import Stripe from 'stripe';
+import { createClient } from '@supabase/supabase-js';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// Your price IDs
+const PRICE_DEVELOPER = 'price_1U46E0C9GlbeYjmfjBSmyIdo';
+const PRICE_PRO = 'price_1U46FIC9GlbeYjmf58xE9Rrb';
+
+export default async function handler(req, res) {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const data = event.data.object;
+
+  // Helper: determine plan from price ID
+  const getPlanFromPrice = (priceId) => {
+    if (priceId === PRICE_DEVELOPER) return 'developer';
+    if (priceId === PRICE_PRO) return 'pro';
+    return 'free';
+  };
+
+  // Helper: create API key
+  const generateApiKey = () =>
+    crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+
+  // Handle subscription events
+  if (event.type === 'customer.subscription.created') {
+    const customerId = data.customer;
+    const priceId = data.items.data[0].price.id;
+    const plan = getPlanFromPrice(priceId);
+
+    // Get customer email
+    const customer = await stripe.customers.retrieve(customerId);
+    const email = customer.email;
+
+    // Check if user exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('*')
+      .eq('stripe_customer_id', customerId)
+      .single();
+
+    let userId;
+
+    if (!existingUser) {
+      // Create user
+      const { data: newUser } = await supabase
+        .from('users')
+        .insert({
+          email,
+          stripe_customer_id: customerId,
+          plan
+        })
+        .select()
+        .single();
+
+      userId = newUser.id;
+
+      // Create API key
+      const apiKey = generateApiKey();
+
+      await supabase.from('api_keys').insert({
+        user_id: userId,
+        api_key: apiKey,
+        plan
+      });
+    } else {
+      userId = existingUser.id;
+
+      // Update plan
+      await supabase
+        .from('users')
+        .update({ plan })
+        .eq('id', userId);
+    }
+  }
+
+  if (event.type === 'customer.subscription.updated') {
+    const customerId = data.customer;
+    const priceId = data.items.data[0].price.id;
+    const plan = getPlanFromPrice(priceId);
+
+    await supabase
+      .from('users')
+      .update({ plan })
+      .eq('stripe_customer_id', customerId);
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const customerId = data.customer;
+
+    await supabase
+      .from('users')
+      .update({ plan: 'free' })
+      .eq('stripe_customer_id', customerId);
+  }
+
+  return res.status(200).send('Webhook processed');
+}
